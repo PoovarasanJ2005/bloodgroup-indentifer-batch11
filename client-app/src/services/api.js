@@ -47,6 +47,12 @@ export const predictionService = {
       headers: { 'Content-Type': 'multipart/form-data' },
       timeout: 30000,
     }),
+  scannerPredict: (imageBase64, deviceName, resolution) =>
+    api.post('/predictions/scanner-predict', {
+      image_base64: imageBase64,
+      device_name: deviceName,
+      resolution: resolution,
+    }, { timeout: 30000 }),
   getHistory: (page = 1, limit = 10) =>
     api.get(`/predictions/history?page=${page}&limit=${limit}`),
   getPrediction: (id) => api.get(`/predictions/prediction/${id}`),

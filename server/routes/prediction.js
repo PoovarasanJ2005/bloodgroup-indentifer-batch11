@@ -48,10 +48,22 @@ router.post('/predict', protect, upload.single('fingerprint'), async (req, res) 
       {
         headers: formData.getHeaders(),
         timeout: 30000,
+        // Accept 422 as valid response (image rejected by validator)
+        validateStatus: (status) => status < 500,
       }
     );
 
     const mlResult = mlResponse.data;
+
+    // ── Handle image rejection (non-fingerprint, AI-generated) ──
+    if (mlResponse.status === 422 || mlResult.rejected) {
+      return res.status(422).json({
+        success: false,
+        rejected: true,
+        rejection_reason: mlResult.rejection_reason,
+        validation: mlResult.validation || {},
+      });
+    }
 
     if (!mlResult.success) {
       return res.status(500).json({ error: 'Prediction failed.' });
@@ -128,12 +140,87 @@ router.post('/predict', protect, upload.single('fingerprint'), async (req, res) 
         allProbabilities: mlResult.all_probabilities,
         createdAt: prediction.createdAt,
       },
+      reliability: mlResult.reliability || null,
+      validation: mlResult.validation || null,
+      warnings: mlResult.warnings || [],
       duplicateWarning,
     });
   } catch (error) {
     console.error('Prediction error:', error.message);
     if (error.code === 'ECONNREFUSED') {
       return res.status(503).json({ error: 'ML service unavailable. Please try again later.' });
+    }
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ─── Scanner Predict (accepts base64 from physical devices) ───────────────────
+router.post('/scanner-predict', protect, async (req, res) => {
+  try {
+    const { image_base64, device_name, resolution } = req.body;
+
+    if (!image_base64) {
+      return res.status(400).json({ error: 'No scanner image data provided.' });
+    }
+
+    // Forward to Flask scanner endpoint
+    const mlResponse = await axios.post(
+      `${process.env.ML_API_URL}/api/scanner/capture`,
+      { image_base64, device_name, resolution },
+      {
+        headers: { 'Content-Type': 'application/json' },
+        timeout: 30000,
+        validateStatus: (status) => status < 500,
+      }
+    );
+
+    const mlResult = mlResponse.data;
+
+    if (mlResponse.status === 422 || mlResult.rejected) {
+      return res.status(422).json({
+        success: false,
+        rejected: true,
+        rejection_reason: mlResult.rejection_reason,
+        source: 'scanner',
+      });
+    }
+
+    if (!mlResult.success) {
+      return res.status(500).json({ error: 'Scanner prediction failed.' });
+    }
+
+    // Save prediction
+    const prediction = await Prediction.create({
+      user: req.user._id,
+      predictionId: mlResult.prediction_id,
+      predictedBloodGroup: mlResult.predicted_blood_group,
+      confidence: mlResult.confidence,
+      allProbabilities: mlResult.all_probabilities,
+      fingerprintHash: mlResult.fingerprint_hash,
+      deviceInfo: {
+        userAgent: req.headers['user-agent'],
+        ip: req.ip,
+        scannerDevice: device_name || 'Unknown',
+      },
+    });
+
+    res.json({
+      success: true,
+      source: 'scanner',
+      prediction: {
+        id: prediction._id,
+        predictionId: prediction.predictionId,
+        predictedBloodGroup: prediction.predictedBloodGroup,
+        confidence: prediction.confidence,
+        allProbabilities: mlResult.all_probabilities,
+        createdAt: prediction.createdAt,
+      },
+      reliability: mlResult.reliability || null,
+    });
+  } catch (error) {
+    console.error('Scanner prediction error:', error.message);
+    if (error.code === 'ECONNREFUSED') {
+      return res.status(503).json({ error: 'ML service unavailable.' });
     }
     res.status(500).json({ error: error.message });
   }

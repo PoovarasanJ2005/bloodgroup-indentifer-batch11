@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { motion } from 'framer-motion';
-import { useAuth } from '../context/AuthContext';
+import { useAuth } from '../context/useAuth';
 import toast from 'react-hot-toast';
 import {
   HiOutlineUser, HiOutlineMail, HiOutlineLockClosed,
@@ -62,7 +62,7 @@ const Register = () => {
 
     setLoading(true);
     try {
-      const user = await register({
+      await register({
         name: formData.name,
         email: formData.email,
         password: formData.password,

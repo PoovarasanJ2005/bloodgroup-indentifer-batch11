@@ -15,8 +15,8 @@ const AdminPredictions = () => {
       const res = await adminService.getPredictions(page, 20);
       setPredictions(res.data.predictions);
       setPagination(res.data.pagination);
-    } catch (err) {
-      console.error('Failed to load predictions');
+    } catch (error) {
+      console.error('Failed to load predictions', error);
     } finally {
       setLoading(false);
     }

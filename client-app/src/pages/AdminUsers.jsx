@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { motion } from 'framer-motion';
 import { adminService } from '../services/api';
 import toast from 'react-hot-toast';
@@ -13,24 +13,24 @@ const AdminUsers = () => {
   const [search, setSearch] = useState('');
   const [loading, setLoading] = useState(true);
 
-  const fetchUsers = async (page = 1) => {
+  const fetchUsers = useCallback(async (page = 1, searchTerm = '') => {
     setLoading(true);
     try {
-      const res = await adminService.getUsers(page, 20, search);
+      const res = await adminService.getUsers(page, 20, searchTerm);
       setUsers(res.data.users);
       setPagination(res.data.pagination);
-    } catch (err) {
+    } catch (_error) {
       toast.error('Failed to load users');
     } finally {
       setLoading(false);
     }
-  };
+  }, []);
 
-  useEffect(() => { fetchUsers(); }, []);
+  useEffect(() => { fetchUsers(); }, [fetchUsers]);
 
   const handleSearch = (e) => {
     e.preventDefault();
-    fetchUsers(1);
+    fetchUsers(1, search);
   };
 
   const handleDelete = async (userId, name) => {
@@ -38,8 +38,8 @@ const AdminUsers = () => {
     try {
       await adminService.deleteUser(userId);
       toast.success('User deleted successfully');
-      fetchUsers(pagination.page);
-    } catch (err) {
+      fetchUsers(pagination.page, search);
+    } catch (_error) {
       toast.error('Failed to delete user');
     }
   };

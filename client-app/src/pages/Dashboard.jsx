@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { Link } from 'react-router-dom';
 import { motion } from 'framer-motion';
-import { useAuth } from '../context/AuthContext';
+import { useAuth } from '../context/useAuth';
 import { predictionService } from '../services/api';
 import {
   HiOutlineFingerPrint, HiOutlineBeaker, HiOutlineChartBar,
@@ -29,14 +29,23 @@ const Dashboard = () => {
       try {
         const res = await predictionService.getStats();
         setStats(res.data.stats);
-      } catch (err) {
-        console.error('Failed to load stats');
+      } catch (error) {
+        console.error('Failed to load stats', error);
       } finally {
         setLoading(false);
       }
     };
     fetchStats();
   }, []);
+
+  if (loading) {
+    return (
+      <div className="loading-screen">
+        <div className="spinner" />
+        <p>Loading dashboard...</p>
+      </div>
+    );
+  }
 
   const getGreeting = () => {
     const hour = new Date().getHours();

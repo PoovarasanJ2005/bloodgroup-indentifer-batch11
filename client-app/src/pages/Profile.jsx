@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { motion } from 'framer-motion';
-import { useAuth } from '../context/AuthContext';
+import { useAuth } from '../context/useAuth';
 import { authService } from '../services/api';
 import toast from 'react-hot-toast';
 import {
@@ -28,7 +28,7 @@ const Profile = () => {
       toast.success('Profile updated!');
       setEditing(false);
     } catch (error) {
-      toast.error('Failed to update profile.');
+      toast.error(error.response?.data?.error || 'Failed to update profile.');
     } finally {
       setLoading(false);
     }

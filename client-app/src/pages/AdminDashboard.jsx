@@ -42,8 +42,8 @@ const AdminDashboard = () => {
       try {
         const res = await adminService.getDashboard();
         setDashboard(res.data.dashboard);
-      } catch (err) {
-        console.error('Failed to load admin dashboard');
+      } catch (error) {
+        console.error('Failed to load admin dashboard', error);
       } finally {
         setLoading(false);
       }

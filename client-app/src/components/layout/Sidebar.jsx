@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { Link, useLocation, useNavigate } from 'react-router-dom';
-import { motion, AnimatePresence } from 'framer-motion';
-import { useAuth } from '../../context/AuthContext';
+import { motion } from 'framer-motion';
+import { useAuth } from '../../context/useAuth';
 import {
   HiOutlineHome, HiOutlineFingerPrint, HiOutlineClock,
   HiOutlineChartBar, HiOutlineUsers, HiOutlineCog,

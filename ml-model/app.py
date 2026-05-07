@@ -1,6 +1,7 @@
 """
 Flask API for Blood Group Prediction
 Serves the trained CNN model for inference.
+Includes: Image validation, AI detection, scanner support.
 """
 
 import os
@@ -8,6 +9,7 @@ import sys
 import json
 import uuid
 import hashlib
+import base64
 import traceback
 import numpy as np
 from flask import Flask, request, jsonify
@@ -22,6 +24,8 @@ if sys.platform == 'win32':
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 import tensorflow as tf
 
+from image_validator import validate_image
+
 app = Flask(__name__)
 CORS(app, origins=["http://localhost:5173", "http://localhost:3000"])
 
@@ -32,21 +36,68 @@ CLASS_MAPPING_PATH = os.path.join(MODEL_DIR, 'class_mapping.json')
 METRICS_PATH = os.path.join(MODEL_DIR, 'metrics.json')
 
 IMG_SIZE = 96
+NUM_CHANNELS = 1  # Auto-detected from model (1=grayscale, 3=RGB)
+CONFIDENCE_THRESHOLD = 40.0   # Minimum % to trust prediction
+TOP2_MARGIN_THRESHOLD = 10.0  # Min gap between top-2 predictions
 
 model = None
 class_mapping = None
 metrics = None
 
 
+def _patch_keras_loading():
+    """
+    Monkey-patch Keras 3.x Operation.from_config so that legacy .h5 models
+    saved with Keras 2.x / TF 2.16- can be loaded despite extra kwargs like
+    renorm, renorm_clipping, renorm_momentum, synchronized, quantization_config.
+    """
+    from keras.src.ops.operation import Operation
+    _original_from_config = Operation.from_config.__func__
+
+    @classmethod
+    def _safe_from_config(cls, config):
+        try:
+            return _original_from_config(cls, config)
+        except (TypeError, ValueError):
+            # Strip known unsupported keys and retry
+            _legacy_keys = {
+                'renorm', 'renorm_clipping', 'renorm_momentum',
+                'synchronized', 'quantization_config',
+            }
+            cleaned = {k: v for k, v in config.items() if k not in _legacy_keys}
+            try:
+                return cls(**cleaned)
+            except (TypeError, ValueError):
+                # Nuclear option: keep only keys the constructor actually accepts
+                import inspect
+                sig = inspect.signature(cls.__init__)
+                valid = set(sig.parameters.keys()) - {'self'}
+                if 'kwargs' in {p.name for p in sig.parameters.values()
+                                if p.kind == inspect.Parameter.VAR_KEYWORD}:
+                    return cls(**cleaned)
+                filtered = {k: v for k, v in cleaned.items() if k in valid}
+                return cls(**filtered)
+
+    Operation.from_config = _safe_from_config
+
+_patch_keras_loading()
+
+
 def load_model():
-    global model, class_mapping, metrics
+    global model, class_mapping, metrics, IMG_SIZE, NUM_CHANNELS
     print("[INFO] Loading CNN model...")
     if os.path.exists(MODEL_PATH):
         model = tf.keras.models.load_model(MODEL_PATH)
+        # Detect image size and channels from model input shape
+        input_shape = model.input_shape
+        if input_shape and len(input_shape) >= 3:
+            IMG_SIZE = input_shape[1] or 96
+            NUM_CHANNELS = input_shape[3] if len(input_shape) >= 4 else 1
         # Build model with dummy input (required for Keras 3.x / TF 2.19)
-        dummy_input = np.zeros((1, IMG_SIZE, IMG_SIZE, 1), dtype=np.float32)
+        dummy_input = np.zeros((1, IMG_SIZE, IMG_SIZE, NUM_CHANNELS), dtype=np.float32)
         model.predict(dummy_input, verbose=0)
-        print("[OK] Model loaded and warmed up successfully!")
+        ch_label = 'RGB' if NUM_CHANNELS == 3 else 'grayscale'
+        print(f"[OK] Model loaded (input: {IMG_SIZE}x{IMG_SIZE}x{NUM_CHANNELS} {ch_label}) and warmed up!")
     else:
         print(f"[WARN] Model not found at {MODEL_PATH}. Train the model first.")
 
@@ -63,13 +114,32 @@ def load_model():
 
 
 def preprocess_image(image_bytes):
-    """Preprocess fingerprint image for CNN prediction."""
+    """Preprocess fingerprint image for CNN prediction.
+    Adapts to model input: grayscale (1ch) or RGB (3ch)."""
     img = Image.open(io.BytesIO(image_bytes))
-    img = img.convert('L')  # Grayscale
+    if NUM_CHANNELS == 3:
+        img = img.convert('RGB')
+    else:
+        img = img.convert('L')
     img = img.resize((IMG_SIZE, IMG_SIZE))
     img_array = np.array(img, dtype=np.float32) / 255.0
-    img_array = img_array.reshape(1, IMG_SIZE, IMG_SIZE, 1)
+    if NUM_CHANNELS == 1:
+        img_array = img_array.reshape(1, IMG_SIZE, IMG_SIZE, 1)
+    else:
+        img_array = img_array.reshape(1, IMG_SIZE, IMG_SIZE, 3)
     return img_array
+
+
+def predict_with_tta(model_instance, img_array, n_augments=8):
+    """Test-Time Augmentation: average predictions across augmented versions
+    for more stable results (+1-2% accuracy at inference)."""
+    preds = [model_instance.predict(img_array, verbose=0)]
+    for _ in range(n_augments - 1):
+        aug = tf.image.random_flip_left_right(img_array)
+        aug = tf.image.random_brightness(aug, 0.08)
+        aug = tf.image.random_contrast(aug, 0.92, 1.08)
+        preds.append(model_instance.predict(aug, verbose=0))
+    return np.mean(preds, axis=0)
 
 
 def compute_fingerprint_hash(image_bytes):
@@ -82,7 +152,6 @@ def extract_feature_vector(image_bytes):
     try:
         if model is None:
             return None
-        img_array = preprocess_image(image_bytes)
         # Use the image hash as a simple non-reversible embedding
         # (avoids Keras 3.x sub-model compatibility issues)
         feature_hash = hashlib.sha256(image_bytes).hexdigest()
@@ -92,24 +161,69 @@ def extract_feature_vector(image_bytes):
         return hashlib.sha256(image_bytes).hexdigest()
 
 
+def analyze_prediction_reliability(predictions):
+    """
+    Analyze if the prediction is reliable using entropy and margin.
+    Returns (is_reliable, confidence_level, details).
+    """
+    probs = predictions[0]
+    sorted_probs = np.sort(probs)[::-1]
+    top1 = float(sorted_probs[0]) * 100
+    top2 = float(sorted_probs[1]) * 100 if len(sorted_probs) > 1 else 0
+
+    # Entropy-based uncertainty
+    entropy = float(-np.sum(probs * np.log2(probs + 1e-10)))
+    max_entropy = np.log2(len(probs))
+    normalized_entropy = entropy / max_entropy
+
+    # Top-2 margin
+    margin = top1 - top2
+
+    details = {
+        'top1_confidence': round(top1, 2),
+        'top2_confidence': round(top2, 2),
+        'margin': round(margin, 2),
+        'entropy': round(entropy, 3),
+        'normalized_entropy': round(normalized_entropy, 3),
+    }
+
+    # Determine reliability
+    if top1 < CONFIDENCE_THRESHOLD:
+        return False, 'very_low', details
+    elif margin < TOP2_MARGIN_THRESHOLD:
+        return False, 'ambiguous', details
+    elif normalized_entropy > 0.7:
+        return False, 'uncertain', details
+    elif top1 < 60:
+        return True, 'low', details
+    elif top1 < 80:
+        return True, 'moderate', details
+    else:
+        return True, 'high', details
+
+
 # --- API Routes ---
 @app.route('/api/health', methods=['GET'])
 def health():
     return jsonify({
         'status': 'healthy',
         'model_loaded': model is not None,
-        'classes': list(class_mapping.values()) if class_mapping else []
+        'classes': list(class_mapping.values()) if class_mapping else [],
+        'features': {
+            'fingerprint_validation': True,
+            'ai_detection': True,
+            'quality_check': True,
+            'scanner_support': True,
+            'confidence_gating': True,
+        }
     })
 
 
-@app.route('/api/predict', methods=['POST'])
-def predict():
-    """Predict blood group from fingerprint image."""
-    if model is None:
-        return jsonify({'error': 'Model not loaded. Train the model first.'}), 503
-
+@app.route('/api/validate', methods=['POST'])
+def validate_only():
+    """Validate an image without predicting (quick check)."""
     if 'fingerprint' not in request.files:
-        return jsonify({'error': 'No fingerprint image provided.'}), 400
+        return jsonify({'error': 'No image provided.'}), 400
 
     file = request.files['fingerprint']
     if file.filename == '':
@@ -117,20 +231,74 @@ def predict():
 
     try:
         image_bytes = file.read()
+        validation = validate_image(image_bytes)
+        return jsonify({
+            'success': True,
+            'validation': validation,
+        })
+    except Exception as e:
+        return jsonify({'error': f'Validation failed: {str(e)}'}), 500
 
-        # Compute image hash for duplicate detection
+
+@app.route('/api/predict', methods=['POST'])
+def predict():
+    """Predict blood group from fingerprint image with full validation."""
+    if model is None:
+        return jsonify({'error': 'Model not loaded. Train the model first.'}), 503
+
+    # Support both file upload and base64 (for scanner devices)
+    image_bytes = None
+
+    if 'fingerprint' in request.files:
+        file = request.files['fingerprint']
+        if file.filename == '':
+            return jsonify({'error': 'No file selected.'}), 400
+        image_bytes = file.read()
+    elif request.is_json and 'image_base64' in request.json:
+        try:
+            b64_data = request.json['image_base64']
+            # Strip data URI prefix if present
+            if ',' in b64_data:
+                b64_data = b64_data.split(',', 1)[1]
+            image_bytes = base64.b64decode(b64_data)
+        except Exception:
+            return jsonify({'error': 'Invalid base64 image data.'}), 400
+    else:
+        return jsonify({'error': 'No fingerprint image provided.'}), 400
+
+    try:
+        # ── Step 1: Validate the image ──
+        validation = validate_image(image_bytes)
+
+        if not validation['is_valid']:
+            return jsonify({
+                'success': False,
+                'rejected': True,
+                'rejection_reason': validation['rejection_reason'],
+                'detected_image_type': validation.get('detected_image_type', 'unknown'),
+                'rejection_icon': validation.get('rejection_icon', '⚠️'),
+                'validation': {
+                    'is_fingerprint': validation['is_fingerprint'],
+                    'is_ai_generated': validation['is_ai_generated'],
+                    'fingerprint_confidence': validation['fingerprint_confidence'],
+                    'ai_confidence': validation['ai_confidence'],
+                },
+            }), 422
+
+        # ── Step 2: Predict ──
         image_hash = compute_fingerprint_hash(image_bytes)
-
-        # Extract feature embedding
         feature_embedding = extract_feature_vector(image_bytes)
 
-        # Preprocess and predict
         img_array = preprocess_image(image_bytes)
-        predictions = model.predict(img_array, verbose=0)
+        predictions = predict_with_tta(model, img_array, n_augments=8)
 
         predicted_class_idx = int(np.argmax(predictions[0]))
         confidence = float(predictions[0][predicted_class_idx])
         predicted_blood_group = class_mapping[predicted_class_idx]
+
+        # ── Step 3: Reliability analysis ──
+        is_reliable, confidence_level, reliability_details = \
+            analyze_prediction_reliability(predictions)
 
         # Build full results with all class probabilities
         all_probabilities = {}
@@ -146,6 +314,26 @@ def predict():
 
         prediction_id = str(uuid.uuid4())
 
+        # Build warnings
+        warnings = list(validation.get('warnings', []))
+        if not is_reliable:
+            if confidence_level == 'very_low':
+                warnings.append(
+                    f"⚠️ Very low confidence ({reliability_details['top1_confidence']}%). "
+                    "The prediction may not be accurate."
+                )
+            elif confidence_level == 'ambiguous':
+                warnings.append(
+                    f"⚠️ Ambiguous result — top predictions are very close "
+                    f"(margin: {reliability_details['margin']}%). "
+                    "Consider re-scanning with better quality."
+                )
+            elif confidence_level == 'uncertain':
+                warnings.append(
+                    "⚠️ High uncertainty detected. The model is not confident "
+                    "in this prediction."
+                )
+
         return jsonify({
             'success': True,
             'prediction_id': prediction_id,
@@ -154,12 +342,99 @@ def predict():
             'all_probabilities': all_probabilities,
             'fingerprint_hash': image_hash,
             'feature_embedding': feature_embedding,
+            'reliability': {
+                'is_reliable': is_reliable,
+                'confidence_level': confidence_level,
+                **reliability_details,
+            },
+            'validation': {
+                'is_fingerprint': validation['is_fingerprint'],
+                'is_ai_generated': validation['is_ai_generated'],
+                'quality_score': validation['quality_score'],
+                'fingerprint_confidence': validation['fingerprint_confidence'],
+            },
+            'warnings': warnings,
         })
 
     except Exception as e:
         print(f"\n[ERROR] Prediction failed:")
         traceback.print_exc()
         return jsonify({'error': f'Prediction failed: {str(e)}'}), 500
+
+
+@app.route('/api/scanner/capture', methods=['POST'])
+def scanner_capture():
+    """
+    Endpoint for physical fingerprint scanner devices.
+    Accepts base64-encoded image data from scanner hardware.
+    """
+    if model is None:
+        return jsonify({'error': 'Model not loaded.'}), 503
+
+    if not request.is_json:
+        return jsonify({'error': 'JSON body required.'}), 400
+
+    data = request.json
+    if 'image_base64' not in data:
+        return jsonify({'error': 'image_base64 field required.'}), 400
+
+    try:
+        b64_data = data['image_base64']
+        if ',' in b64_data:
+            b64_data = b64_data.split(',', 1)[1]
+        image_bytes = base64.b64decode(b64_data)
+
+        # Validate
+        validation = validate_image(image_bytes)
+        if not validation['is_valid']:
+            return jsonify({
+                'success': False,
+                'rejected': True,
+                'rejection_reason': validation['rejection_reason'],
+                'source': 'scanner',
+            }), 422
+
+        # Predict
+        img_array = preprocess_image(image_bytes)
+        predictions = model.predict(img_array, verbose=0)
+
+        predicted_class_idx = int(np.argmax(predictions[0]))
+        confidence = float(predictions[0][predicted_class_idx])
+        predicted_blood_group = class_mapping[predicted_class_idx]
+
+        is_reliable, confidence_level, reliability_details = \
+            analyze_prediction_reliability(predictions)
+
+        all_probabilities = {}
+        for idx, prob in enumerate(predictions[0]):
+            all_probabilities[class_mapping[idx]] = round(float(prob) * 100, 2)
+
+        all_probabilities = dict(sorted(
+            all_probabilities.items(), key=lambda x: x[1], reverse=True
+        ))
+
+        return jsonify({
+            'success': True,
+            'source': 'scanner',
+            'prediction_id': str(uuid.uuid4()),
+            'predicted_blood_group': predicted_blood_group,
+            'confidence': round(confidence * 100, 2),
+            'all_probabilities': all_probabilities,
+            'fingerprint_hash': compute_fingerprint_hash(image_bytes),
+            'reliability': {
+                'is_reliable': is_reliable,
+                'confidence_level': confidence_level,
+                **reliability_details,
+            },
+            'device_info': {
+                'device_name': data.get('device_name', 'Unknown Scanner'),
+                'resolution': data.get('resolution', 'Unknown'),
+            },
+        })
+
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'error': f'Scanner capture failed: {str(e)}'}), 500
 
 
 @app.route('/api/model-info', methods=['GET'])
@@ -181,4 +456,5 @@ def model_info():
 if __name__ == '__main__':
     load_model()
     print("\n[SERVER] Flask ML API running on http://localhost:5000")
+    print("[FEATURES] Image validation | AI detection | Scanner support")
     app.run(host='0.0.0.0', port=5000, debug=False)

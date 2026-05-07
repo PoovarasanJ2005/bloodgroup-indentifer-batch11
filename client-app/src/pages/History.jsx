@@ -16,8 +16,8 @@ const History = () => {
       const res = await predictionService.getHistory(page, 10);
       setPredictions(res.data.predictions);
       setPagination(res.data.pagination);
-    } catch (err) {
-      console.error('Failed to load history');
+    } catch (error) {
+      console.error('Failed to load history', error);
     } finally {
       setLoading(false);
     }
